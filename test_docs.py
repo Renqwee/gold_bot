@@ -84,3 +84,36 @@ def test_responsive_meta(html):
 
 def test_dark_mode_support(html):
     assert "prefers-color-scheme: dark" in html
+
+
+# ---------- وضع تيليقرام ----------
+
+
+def test_telegram_mode_hides_only_irrelevant_parts(html):
+    """داخل تيليقرام نخفي ما لا يخدم المستخدم — لكن ليس التنبيه القانوني."""
+    assert ".in-telegram .topbar" in html
+    assert ".in-telegram #install" in html
+    assert ".in-telegram .site-only" in html or ".in-telegram footer .site-only" in html
+    assert ".in-telegram .disclaimer" not in html, "التنبيه لازم يبقى ظاهراً دائماً"
+    assert ".in-telegram #calc" not in html, "الحاسبة هي سبب الفتح، ما تنخفي"
+
+
+def test_telegram_detection_is_independent_of_theme(html):
+    """إضافة الصنف لازم تكون خارج دالة الوضع الليلي.
+
+    لو دُمجا، أي مستخدم حافظ وضعاً بنفسه ما ينطبق عليه تخطيط تيليقرام —
+    وهذا خلل وقعنا فيه فعلاً.
+    """
+    detect = html.index('classList.add("in-telegram")')
+    theme_fn = html.index("function telegramTheme()")
+    assert detect < theme_fn, "الكشف لازم يسبق دالة الوضع ويكون مستقلاً عنها"
+
+
+def test_no_external_script_tags(html):
+    """لا سكربتات خارجية إطلاقاً — ولا حتى سكربت تيليقرام الرسمي.
+
+    الصفحة تبقى ملفاً واحداً يشتغل بلا شبكة إضافية، وتقرأ إعدادات تيليقرام
+    من هاش الرابط بدل تحميل مكتبته.
+    """
+    assert "<script src" not in html.replace(" ", "").replace("<scriptsrc", "<script src")
+    assert "tgWebAppThemeParams" in html

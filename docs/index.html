@@ -442,6 +442,17 @@ details .body { padding-bottom: 16px; color: var(--text-2); font-size: 15px; }
 details .body p { margin: 0; }
 
 /* ==========================================================================
+   داخل تيليقرام
+   لتيليقرام رأسه وزر رجوعه، والمستخدم جاي للأسعار مو للتوثيق —
+   فنخفي ما لا يخدمه ونرفع الأسعار للأعلى.
+   ========================================================================== */
+.in-telegram .topbar,
+.in-telegram #install,
+.in-telegram footer .site-only { display: none; }
+.in-telegram .hero { padding-top: 18px; }
+.in-telegram body { font-size: 16px; }
+
+/* ==========================================================================
    الظهور بالتمرير
    ========================================================================== */
 .reveal { opacity: 0; transform: translateY(14px); transition: opacity .6s var(--ease), transform .6s var(--ease); }
@@ -667,7 +678,9 @@ footer a { color: var(--gold); }
       (تبعد ١٫٤٪ عن الفوري) ولا توكنات كريبتو تتداول ٢٤/٧.
       أي قيمة خارج المدى المنطقي أو تقفز أكثر من ٣٪ فجأة تُرفض ويُجرَّب المصدر التالي،
       وإذا فشل الكل يرجّع آخر قيمة معروفة <b>ويعلّمها «قديمة»</b> بدل ما يعطيك رقماً خاطئاً بصمت.
-      Swissquote مستبعد من هذي الصفحة فقط لأنه لا يسمح للمتصفح بقراءته مباشرة.
+      <b>ليش رقم الصفحة قد يختلف عن رقم البوت بقروش؟</b> البوت يبدأ بـSwissquote،
+      والمتصفح لا يقدر يقرأه (الخادم يمنع القراءة من صفحات أخرى)، فالصفحة تبدأ بـgold-api.
+      الفرق المقيس بينهما <b>0.03٪</b> — أي ١٫٤ دولار على الأونصة، أو ١٥ هللة على الجرام.
     </p>
   </section>
 
@@ -711,7 +724,7 @@ footer a { color: var(--gold); }
   </section>
 
   <!-- ============================ التشغيل ============================ -->
-  <section class="reveal">
+  <section class="reveal" id="install">
     <div class="sec-head">
       <h2>شغّله بنفسك</h2>
       <p class="sub">بايثون فقط — بدون قاعدة بيانات ولا مفاتيح API مدفوعة.</p>
@@ -736,7 +749,7 @@ cp .env.example .env     # وحط توكنك داخله
     الأسعار للذهب الخام من مصادر عامة، للاسترشاد فقط — بدون مصنعية أو ضريبة أو هامش المحل،
     وقد تختلف عن سعر السوق المحلي. لا يُقصد بها أي نصيحة استثمارية.
   </p>
-  <p>صُنع بـ 🪙 — مفتوح المصدر</p>
+  <p class="site-only">صُنع بـ 🪙 — مفتوح المصدر</p>
 </footer>
 
 <div class="toast" id="toast"></div>
@@ -937,6 +950,32 @@ cp .env.example .env     # وحط توكنك داخله
     input.addEventListener("input", render);
   });
 
+  /* ---------------- داخل تيليقرام ----------------
+     تيليقرام يمرّر إعداداته في هاش الرابط (#tgWebAppThemeParams=...) قبل ما
+     يُحمَّل أي سكربت. نقرأها مباشرة بدل ما نجيب telegram-web-app.js من الخارج،
+     عشان تبقى الصفحة ملفاً واحداً مكتفياً بنفسه. */
+  var IN_TELEGRAM = location.hash.indexOf("tgWebApp") >= 0;
+  if (IN_TELEGRAM) { document.documentElement.classList.add("in-telegram"); }
+
+  // دالة نقية: ترجّع الوضع المقترح فقط. الكشف فوق منفصل عنها عمداً —
+  // لو دُمجا، أي مستخدم حافظ وضعاً بنفسه ما ينطبق عليه تخطيط تيليقرام.
+  function telegramTheme() {
+    if (!IN_TELEGRAM) { return null; }
+    try {
+      var raw = new URLSearchParams(location.hash.slice(1)).get("tgWebAppThemeParams");
+      if (!raw) { return null; }
+      var bg = JSON.parse(decodeURIComponent(raw)).bg_color;
+      if (!/^#[0-9a-f]{6}$/i.test(bg || "")) { return null; }
+      // نستنتج الوضع من إضاءة لون خلفية تيليقرام
+      var lum = (parseInt(bg.substr(1, 2), 16) * 299
+               + parseInt(bg.substr(3, 2), 16) * 587
+               + parseInt(bg.substr(5, 2), 16) * 114) / 1000;
+      return lum < 128 ? "dark" : "light";
+    } catch (e) {
+      return null;
+    }
+  }
+
   /* ---------------- الوضع الليلي ---------------- */
   var themeBtn = el("themeBtn");
   function applyTheme(theme) {
@@ -950,7 +989,8 @@ cp .env.example .env     # وحط توكنك داخله
   }
   var saved = null;
   try { saved = localStorage.getItem("theme"); } catch (e) { /* وضع التصفح الخاص */ }
-  applyTheme(saved);
+  // داخل تيليقرام نتبع وضع التطبيق، إلا إذا كان المستخدم اختار وضعاً بنفسه
+  applyTheme(saved || telegramTheme());
 
   themeBtn.addEventListener("click", function () {
     var dark = document.documentElement.getAttribute("data-theme") === "dark"

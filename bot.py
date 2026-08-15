@@ -5,6 +5,7 @@
 
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -16,8 +17,10 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    MenuButtonCommands,
     ReplyKeyboardMarkup,
     Update,
+    WebAppInfo,
 )
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
@@ -68,6 +71,9 @@ RIYADH = ZoneInfo("Asia/Riyadh")
 # رابط صفحة الشرح — يُضبط في .env، وإذا ما وُجد تختفي أزرار الرابط تلقائياً
 SITE_URL = ""
 
+# صيغة توكن تيليقرام: معرّف رقمي : سرّ
+TOKEN_PATTERN = re.compile(r"\d{6,}:[A-Za-z0-9_-]{30,}")
+
 # مفاتيح chat_data
 LAST_OUNCE = "last_ounce"
 PINNED_RATE = "pinned_rate"  # موجود = المستخدم ثبّت سعر الصرف يدوياً
@@ -83,17 +89,36 @@ BTN_BARS = "🧱 السبائك"
 BTN_SHOP = "🏪 قارن محل"
 BTN_ALERTS = "🔔 تنبيهاتي"
 BTN_HELP = "❓ مساعدة"
+BTN_APP = "🌐 الحاسبة"
 
 
-def main_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton(BTN_NOW), KeyboardButton(BTN_MY_KARAT)],
-            [KeyboardButton(BTN_WEIGHT), KeyboardButton(BTN_BARS)],
-            [KeyboardButton(BTN_SHOP), KeyboardButton(BTN_ALERTS)],
-            [KeyboardButton(BTN_HELP)],
-        ],
-        resize_keyboard=True,
+def main_keyboard(private: bool = True) -> ReplyKeyboardMarkup:
+    """اللوحة الثابتة.
+
+    زر الحاسبة يفتح الصفحة **داخل تيليقرام** بدل متصفح خارجي — وتيليقرام
+    يقبل أزرار الويب في المحادثات الخاصة فقط، فنحذفه في المجموعات.
+    """
+    rows = [
+        [KeyboardButton(BTN_NOW), KeyboardButton(BTN_MY_KARAT)],
+        [KeyboardButton(BTN_WEIGHT), KeyboardButton(BTN_BARS)],
+        [KeyboardButton(BTN_SHOP), KeyboardButton(BTN_ALERTS)],
+    ]
+
+    last = []
+    if SITE_URL and private:
+        last.append(KeyboardButton(BTN_APP, web_app=WebAppInfo(url=SITE_URL)))
+    last.append(KeyboardButton(BTN_HELP))
+    rows.append(last)
+
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def app_button(label: str = "🌐 افتح الحاسبة") -> InlineKeyboardMarkup | None:
+    """زر يفتح الصفحة كتطبيق داخل تيليقرام."""
+    if not SITE_URL:
+        return None
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, web_app=WebAppInfo(url=SITE_URL))]]
     )
 
 
@@ -137,6 +162,11 @@ def escape(text: str) -> str:
 
 def fav_karat(context: ContextTypes.DEFAULT_TYPE) -> int:
     return context.chat_data.get(FAV_KARAT, DEFAULT_KARAT)
+
+
+def is_private(update: Update) -> bool:
+    chat = update.effective_chat
+    return chat is not None and chat.type == "private"
 
 
 def market_state(quote: rates.Quote | None = None) -> market.MarketStatus:
@@ -1027,11 +1057,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"<i>عيارك الافتراضي {DEFAULT_KARAT} — غيّره بـ /fav</i>\n"
         "<i>/help لكل الميزات</i>",
         parse_mode=ParseMode.HTML,
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(private=is_private(update)),
     )
-    if (markup := site_button()) is not None:
+
+    if not is_private(update):
+        return  # أزرار الويب لا تعمل في المجموعات
+
+    if (markup := app_button()) is not None:
         await update.message.reply_text(
-            "🌐 وفيه صفحة فيها شرح كامل وحاسبة مباشرة:",
+            "🌐 <b>الحاسبة المرئية</b>\n"
+            "كل العيارات والأوزان في شاشة وحدة — تفتح داخل تيليقرام بدون ما تطلع منه.",
+            parse_mode=ParseMode.HTML,
             reply_markup=markup,
         )
 
@@ -1081,7 +1117,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "الأسعار للذهب الخام من مصادر عامة، للاسترشاد فقط — "
         "بدون مصنعية أو ضريبة، وقد تختلف عن سعر السوق المحلي.",
         parse_mode=ParseMode.HTML,
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(private=is_private(update)),
     )
 
 
@@ -1100,7 +1136,11 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "وليست نصيحة استثمارية.</i>"
         f"{link}",
         parse_mode=ParseMode.HTML,
-        reply_markup=site_button("🌐 افتح الصفحة"),
+        reply_markup=(
+            app_button("🌐 افتح الحاسبة")
+            if is_private(update)
+            else site_button("🌐 افتح الصفحة")
+        ),
         disable_web_page_preview=True,
     )
 
@@ -1132,6 +1172,9 @@ async def post_init(application: Application) -> None:
             BotCommand("help", "المساعدة"),
         ]
     )
+    # نُبقي زر القائمة على الأوامر عمداً: لو خليناه تطبيق ويب تختفي قائمة
+    # الأوامر الـ١٤ من الواجهة، والحاسبة موجودة أصلاً كزر في اللوحة.
+    await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     await application.bot.set_my_short_description("سعر جرام الذهب بالريال، لكل العيارات، مباشر.")
     await application.bot.set_my_description(
         "أعطيك سعر جرام الذهب بالريال السعودي لكل العيارات (24، 22، 21، 18، 14، 12، 10، 9) "
@@ -1156,6 +1199,18 @@ def main() -> None:
             "حطه في ملف .env جنب bot.py بهذا الشكل:\n"
             "  BOT_TOKEN=123:abc\n"
             "أو مرّره مباشرة: BOT_TOKEN=123:abc python bot.py"
+        )
+
+    # فحص الصيغة قبل ما نتصل — يكشف التوكن الملتصق بمتغيّر بعده،
+    # ويعطي رسالة مفهومة بدل «Invalid token» من تيليقرام
+    if not TOKEN_PATTERN.fullmatch(token):
+        raise SystemExit(
+            "صيغة التوكن غير صحيحة.\n"
+            "المتوقع: أرقام ثم نقطتان ثم ٣٥ حرفاً تقريباً، مثل 123456789:AAF-xxxxx\n\n"
+            "السبب الشائع: متغيّر ثانٍ التصق بنهاية سطر التوكن في .env — تأكد أن\n"
+            "كل متغيّر في سطر مستقل، وأن الملف ينتهي بسطر جديد.\n\n"
+            f"طول ما قرأته: {len(token)} حرفاً"
+            + (" — يبدو أن SITE_URL ملتصق به." if "SITE_URL" in token else "")
         )
 
     # الإعدادات والتنبيهات تبقى محفوظة بعد إعادة التشغيل
