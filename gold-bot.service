@@ -1,0 +1,27 @@
+# تشغيل البوت ٢٤ ساعة مع إعادة تشغيل تلقائية.
+#
+#   عدّل User و WorkingDirectory و ExecStart لمسارك، ثم:
+#   sudo cp gold-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now gold-bot
+#   journalctl -u gold-bot -f        # لمتابعة السجل
+#
+# ملاحظة: %i تشتغل فقط في وحدات القوالب (اسم@.service)، فالمسارات هنا صريحة.
+
+[Unit]
+Description=Gold price Telegram bot
+After=network-online.target
+Wants=network-online.target
+# لو الشبكة رجعت متأخرة، لا توقف المحاولات
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=renqwee
+WorkingDirectory=/home/renqwee/Work/Projects/Gold_bot
+ExecStart=/home/renqwee/Work/Projects/Gold_bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
