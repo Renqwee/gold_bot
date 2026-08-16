@@ -31,3 +31,7 @@ docs/
 # Docker files
 Dockerfile
 .dockerignore
+# dev tools
+.pytest_cache/
+measure_sources.py
+source_measurements.csv

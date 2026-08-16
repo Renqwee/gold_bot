@@ -199,6 +199,24 @@ def money_big(value: Decimal, cur: currencies.Currency) -> str:
     return fmt(value, 0) if abs(value) >= 10_000 else money(value, cur)
 
 
+STATE_FILENAME = "bot_state.pickle"
+
+
+def state_file() -> Path:
+    """مسار ملف حالة البوت — التنبيهات والعيار المفضل والعملة وسجل الإغلاقات.
+
+    داخل دوكر يُضبط `BOT_STATE_DIR=/data` ويُربط بـ volume، وإلا تضيع الحالة
+    مع كل تحديث للصورة. وبدون المتغيّر يبقى الملف جنب `bot.py` كما كان.
+    """
+    directory = os.environ.get("BOT_STATE_DIR", "").strip()
+    if not directory:
+        return Path(__file__).with_name(STATE_FILENAME)
+
+    path = Path(directory)
+    path.mkdir(parents=True, exist_ok=True)
+    return path / STATE_FILENAME
+
+
 def is_private(update: Update) -> bool:
     chat = update.effective_chat
     return chat is not None and chat.type == "private"
@@ -1536,7 +1554,7 @@ def main() -> None:
         )
 
     # الإعدادات والتنبيهات تبقى محفوظة بعد إعادة التشغيل
-    persistence = PicklePersistence(filepath=Path(__file__).with_name("bot_state.pickle"))
+    persistence = PicklePersistence(filepath=state_file())
 
     app = (
         Application.builder()

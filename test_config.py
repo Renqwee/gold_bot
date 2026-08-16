@@ -69,3 +69,33 @@ def test_site_url_must_be_absolute():
     for bad in ("renqwee.github.io/gold_bot/", "ftp://x.com", "", "  "):
         assert not bad.strip().startswith(("http://", "https://"))
     assert "https://renqwee.github.io/gold_bot/docs/".startswith("https://")
+
+
+# ---------- مسار ملف الحالة ----------
+
+
+def test_state_file_defaults_next_to_bot(monkeypatch):
+    """بدون المتغيّر يبقى السلوك القديم — تشغيل محلي بلا مفاجآت."""
+    from pathlib import Path
+
+    monkeypatch.delenv("BOT_STATE_DIR", raising=False)
+    path = bot.state_file()
+    assert path.name == "bot_state.pickle"
+    assert path.parent == Path(bot.__file__).parent
+
+
+def test_state_file_follows_env(tmp_path, monkeypatch):
+    """داخل دوكر يوجَّه لمجلد مربوط بـ volume."""
+    target = tmp_path / "data"
+    monkeypatch.setenv("BOT_STATE_DIR", str(target))
+    path = bot.state_file()
+    assert path == target / "bot_state.pickle"
+    assert target.is_dir(), "المجلد لازم يُنشأ إذا ما كان موجوداً"
+
+
+def test_state_dir_ignores_blank_value(monkeypatch):
+    """متغيّر فاضي في .env ما يكسر المسار."""
+    from pathlib import Path
+
+    monkeypatch.setenv("BOT_STATE_DIR", "   ")
+    assert bot.state_file().parent == Path(bot.__file__).parent
