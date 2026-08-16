@@ -25,7 +25,7 @@ from telegram import (
     WebAppInfo,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -1479,11 +1479,23 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("خطأ أثناء المعالجة:", exc_info=context.error)
+    """أخطاء الشبكة العابرة تُسجَّل بسطر، والأخطاء الحقيقية بتتبّع كامل."""
+    error = context.error
+
+    if isinstance(error, NetworkError):
+        # تعذّر الوصول لتيليقرام. صفحة تتبّع كاملة تغرق السجل بلا فائدة،
+        # ومحاولة الاعتذار للمستخدم راح تفشل بنفس السبب.
+        logger.warning("تعذّر الاتصال بتيليقرام: %s", error)
+        return
+
+    logger.error("خطأ أثناء المعالجة:", exc_info=error)
     if isinstance(update, Update) and update.effective_message:
-        await update.effective_message.reply_text(
-            "❌ صار خطأ غير متوقع. جرّب مرة ثانية."
-        )
+        try:
+            await update.effective_message.reply_text(
+                "❌ صار خطأ غير متوقع. جرّب مرة ثانية."
+            )
+        except TelegramError as exc:
+            logger.warning("وتعذّر إبلاغ المستخدم كمان: %s", exc)
 
 
 async def post_init(application: Application) -> None:
@@ -1559,6 +1571,11 @@ def main() -> None:
     app = (
         Application.builder()
         .token(token)
+        .connect_timeout(20)
+        .read_timeout(20)
+        .write_timeout(20)
+        .pool_timeout(10)
+        .get_updates_read_timeout(45)
         .persistence(persistence)
         .post_init(post_init)
         .build()
@@ -1604,7 +1621,9 @@ def main() -> None:
     )
 
     logger.info("البوت شغّال…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # ‏bootstrap_retries=-1: يصبر بلا حد عند الإقلاع بدل ما يموت من أول فشل
+    # شبكة. مهم على السيرفرات: دوكر يبدأ قبل ما تكتمل الشبكة أحياناً.
+    app.run_polling(allowed_updates=Update.ALL_TYPES, bootstrap_retries=-1)
 
 
 if __name__ == "__main__":
