@@ -6,7 +6,7 @@
 import logging
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -35,6 +35,7 @@ from telegram.ext import (
 )
 
 import alerts as alerts_store
+import health
 import market
 import rates
 import understand as nlp
@@ -74,6 +75,9 @@ RIYADH = ZoneInfo("Asia/Riyadh")
 # رابط صفحة الشرح — يُضبط في .env، وإذا ما وُجد تختفي أزرار الرابط تلقائياً
 SITE_URL = ""
 
+# معرّف صاحب البوت — يستقبل تنبيهات صحة المصادر. اختياري.
+OWNER_ID = 0
+
 # صيغة توكن تيليقرام: معرّف رقمي : سرّ
 TOKEN_PATTERN = re.compile(r"\d{6,}:[A-Za-z0-9_-]{30,}")
 
@@ -81,6 +85,10 @@ TOKEN_PATTERN = re.compile(r"\d{6,}:[A-Za-z0-9_-]{30,}")
 LAST_OUNCE = "last_ounce"
 PINNED_RATE = "pinned_rate"  # موجود = المستخدم ثبّت سعر الصرف يدوياً
 FAV_KARAT = "fav_karat"
+
+# مفاتيح bot_data
+MONITOR = "health_monitor"
+OWN_CLOSES = "own_closes"
 
 DEFAULT_KARAT = 21  # الأكثر تداولاً في السوق السعودي
 
@@ -185,9 +193,14 @@ def market_line(state: market.MarketStatus) -> str:
     return f"🔴 السوق مغلق — سعر إغلاق الجمعة • يفتح بعد {remaining}"
 
 
-async def change_line(current: Decimal, market_open: bool) -> str:
+async def change_line(
+    current: Decimal,
+    market_open: bool,
+    context: ContextTypes.DEFAULT_TYPE | None = None,
+) -> str:
     """سطر التغيّر عن الإغلاق المرجعي، أو فراغ إذا البيانات مو متوفرة."""
-    pct = await rates.change_pct(current, market_open)
+    own = context.bot_data.get(OWN_CLOSES) if context else None
+    pct = await rates.change_pct(current, market_open, own_closes=own)
     if pct is None:
         return ""
     arrow = "▲" if pct >= 0 else "▼"
@@ -310,7 +323,7 @@ async def build_live_message(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"<b>🟡 سعر الذهب</b>\n"
         f"{market_line(state)}\n\n"
         f"الأونصة: <b>${fmt(quote.value)}</b>"
-        f"{await change_line(quote.value, state.is_open)}\n"
+        f"{await change_line(quote.value, state.is_open, context)}\n"
         f"<pre>{rows}</pre>"
         f"<i>المصدر: {escape(quote.source)} • {freshness(quote)}</i>\n"
         f"<i>الدولار: {escape(rate_label)}</i>{warning}\n\n"
@@ -846,6 +859,61 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.warning("تعذّر إرسال تنبيه للمحادثة %s: %s", alert.chat_id, exc)
 
 
+# ---------- المراقبة والسجل ----------
+
+
+async def health_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يراقب أي مصدر يشتغل فعلاً، وينبّه المالك عند تغيّر الحالة."""
+    if not OWNER_ID:
+        return
+
+    monitor = context.bot_data.get(MONITOR)
+    if monitor is None:
+        monitor = health.Monitor(primary=rates.SPOT_SOURCES[0][0])
+        context.bot_data[MONITOR] = monitor
+
+    try:
+        quote = await rates.gold_usd_per_ounce()
+        report = monitor.observe(quote.source, stale=quote.stale)
+    except Exception:  # noqa: BLE001 — الفشل التام حالة نراقبها لا خطأ نخفيه
+        report = monitor.observe(None)
+
+    if report is None:
+        return
+
+    try:
+        await context.bot.send_message(chat_id=OWNER_ID, text=report)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("تعذّر تنبيه المالك: %s", exc)
+
+
+async def record_close(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يسجّل سعر الإغلاق يومياً من نفس المصادر التي يعرضها البوت.
+
+    يعطينا تاريخاً مستقلاً عن أي طرف ثالث، ويكشف انحراف أي مصدر لاحقاً.
+    """
+    if not market.status().is_open:
+        return  # عطلة نهاية الأسبوع: لا إغلاق جديد
+
+    try:
+        quote = await rates.gold_usd_per_ounce()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("تعذّر تسجيل الإغلاق: %s", exc)
+        return
+    if quote.stale:
+        return
+
+    closes = context.bot_data.setdefault(OWN_CLOSES, {})
+    today = datetime.now(timezone.utc).date().isoformat()
+    closes[today] = str(quote.value)
+
+    # نحتفظ بآخر ٤٠٠ يوم — يكفي لأي مقارنة سنوية بلا تضخّم
+    for old in sorted(closes)[:-400]:
+        del closes[old]
+
+    logger.info("سُجّل إغلاق %s: %s من %s", today, quote.value, quote.source)
+
+
 # ---------- الإعدادات ----------
 
 
@@ -969,9 +1037,17 @@ async def sources_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"({gold_quote.quoted_at.astimezone(RIYADH).strftime('%Y-%m-%d')})"
         )
 
-    closes = await rates.daily_closes()
+    own = context.bot_data.get(OWN_CLOSES, {})
+    closes = rates.merge_closes(own, await rates.daily_closes())
     if closes:
-        lines.append(f"📅 إغلاقات يومية متاحة: {len(closes)}")
+        lines.append(
+            f"📅 إغلاقات يومية: {len(closes)} "
+            f"(منها {len(own)} من تسجيل البوت نفسه)"
+        )
+
+    monitor = context.bot_data.get(MONITOR)
+    if monitor is not None:
+        lines.append(f"💚 صحة المصادر: {monitor.state.value} منذ {clock(monitor.since)}")
 
     order = " ← ".join(name for name, _url, _parser in rates.SPOT_SOURCES)
     body = "\n".join(lines)
@@ -1218,8 +1294,14 @@ def main() -> None:
     # يقرأ ملف .env من جنب bot.py (متغيّرات البيئة الموجودة أصلاً لها الأولوية)
     load_dotenv(Path(__file__).with_name(".env"))
 
-    global SITE_URL
+    global SITE_URL, OWNER_ID
     SITE_URL = os.environ.get("SITE_URL", "").strip()
+    raw_owner = os.environ.get("OWNER_ID", "").strip()
+    if raw_owner:
+        try:
+            OWNER_ID = int(raw_owner)
+        except ValueError:
+            logger.warning("OWNER_ID لازم يكون رقماً — تجاهلته")
     if SITE_URL and not SITE_URL.startswith(("http://", "https://")):
         logger.warning("SITE_URL لازم يبدأ بـ https:// — تجاهلته")
         SITE_URL = ""
@@ -1284,6 +1366,13 @@ def main() -> None:
         interval=alerts_store.CHECK_INTERVAL_SECONDS,
         first=30,
         name="check_alerts",
+    )
+    app.job_queue.run_repeating(
+        health_check, interval=600, first=60, name="health_check"
+    )
+    # ٢٠:٥٠ بتوقيت UTC = قبل إغلاق الجمعة بعشر دقائق، وهو آخر سعر لكل يوم تداول
+    app.job_queue.run_daily(
+        record_close, time=time(20, 50, tzinfo=timezone.utc), name="record_close"
     )
 
     logger.info("البوت شغّال…")

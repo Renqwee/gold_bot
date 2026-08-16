@@ -321,6 +321,24 @@ async def daily_closes() -> list[tuple[date, Decimal]]:
         return closes
 
 
+def merge_closes(
+    own: dict[str, str] | None,
+    fetched: list[tuple[date, Decimal]],
+) -> list[tuple[date, Decimal]]:
+    """يدمج سجلّنا الخاص مع إغلاقات المصدر — سجلّنا له الأولوية.
+
+    سجلّنا مأخوذ من نفس المصادر التي يعرضها البوت، فهو أوفق لأرقامه من رقم
+    طرف ثالث. والمصدر يغطي ما قبل تشغيل البوت وما فاتنا وقت التوقف.
+    """
+    merged: dict[date, Decimal] = {day: price for day, price in fetched}
+    for iso, value in (own or {}).items():
+        try:
+            merged[date.fromisoformat(iso)] = Decimal(value)
+        except (ValueError, InvalidOperation):
+            logger.warning("سطر تالف في سجل الإغلاقات: %r", iso)
+    return sorted(merged.items(), key=lambda row: row[0], reverse=True)
+
+
 def reference_close(
     closes: list[tuple[date, Decimal]], market_open: bool
 ) -> Decimal | None:
@@ -337,9 +355,14 @@ def reference_close(
     return closes[1][1] if len(closes) > 1 else None
 
 
-async def change_pct(current: Decimal, market_open: bool) -> Decimal | None:
+async def change_pct(
+    current: Decimal,
+    market_open: bool,
+    own_closes: dict[str, str] | None = None,
+) -> Decimal | None:
     """نسبة التغيّر عن الإغلاق المرجعي، أو None إذا البيانات مو متوفرة."""
-    reference = reference_close(await daily_closes(), market_open)
+    closes = merge_closes(own_closes, await daily_closes())
+    reference = reference_close(closes, market_open)
     if reference is None or reference == 0:
         return None
     return (current - reference) / reference * 100
