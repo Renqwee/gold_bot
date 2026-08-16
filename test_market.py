@@ -175,14 +175,14 @@ def test_pop_triggered_fires_once_and_removes():
     alerts_store.add(store, make_alert(target="460", direction=ABOVE))
     alerts_store.add(store, make_alert(target="900", direction=ABOVE))
 
-    fired = alerts_store.pop_triggered(store, lambda _karat: Decimal("470"))
+    fired = alerts_store.pop_triggered(store, lambda _a: Decimal("470"))
     assert len(fired) == 1
     assert fired[0][0].target == Decimal("460")
     assert fired[0][1] == Decimal("470")
 
     # اللي تحقق انحذف، واللي ما تحقق باقي
     assert len(alerts_store.for_chat(store, 1)) == 1
-    assert alerts_store.pop_triggered(store, lambda _k: Decimal("470")) == []
+    assert alerts_store.pop_triggered(store, lambda _a: Decimal("470")) == []
 
 
 def test_pop_triggered_uses_each_alerts_own_karat():
@@ -191,7 +191,27 @@ def test_pop_triggered_uses_each_alerts_own_karat():
     alerts_store.add(store, make_alert(karat=18, target="500", direction=ABOVE))
 
     prices = {24: Decimal("520"), 18: Decimal("390")}
-    fired = alerts_store.pop_triggered(store, lambda karat: prices[karat])
+    fired = alerts_store.pop_triggered(store, lambda a: prices[a.karat])
 
     assert len(fired) == 1
     assert fired[0][0].karat == 24
+
+
+def test_alert_carries_its_currency():
+    """كل تنبيه يحمل عملة صاحبه — قروب إماراتي ما يستقبل سعراً بالريال."""
+    aed = make_alert(target="450")
+    object.__setattr__(aed, "currency", "AED") if hasattr(aed, "__setattr__") else None
+    aed = Alert(chat_id=1, karat=21, target=Decimal("450"), direction=ABOVE, currency="AED")
+    assert "AED" in aed.label
+    assert make_alert().currency == "SAR"
+
+
+def test_untriceable_alert_is_kept_not_dropped():
+    """لو تعذّر تسعير عملة التنبيه، نؤجّله — لا نحذفه ولا نطلقه بسعر خاطئ."""
+    store = {}
+    alerts_store.add(store, make_alert(target="460", direction=ABOVE))
+
+    fired = alerts_store.pop_triggered(store, lambda _a: None)
+
+    assert fired == []
+    assert len(alerts_store.for_chat(store, 1)) == 1

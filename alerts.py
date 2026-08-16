@@ -24,6 +24,7 @@ class Alert:
     karat: int
     target: Decimal
     direction: str  # ABOVE أو BELOW
+    currency: str = "SAR"  # التنبيه يُرسل بعملة صاحبه
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def triggered_by(self, price: Decimal) -> bool:
@@ -38,7 +39,7 @@ class Alert:
     @property
     def label(self) -> str:
         word = "فوق" if self.direction == ABOVE else "تحت"
-        return f"عيار {self.karat} {word} {self.target:,} ريال"
+        return f"عيار {self.karat} {word} {self.target:,} {self.currency}"
 
 
 def direction_for(target: Decimal, current: Decimal) -> str:
@@ -77,14 +78,18 @@ def remove(store: dict, chat_id: int, index: int) -> Alert | None:
     return target
 
 
-def pop_triggered(store: dict, price_for_karat) -> list[tuple[Alert, Decimal]]:
-    """يسحب التنبيهات اللي تحققت ويحذفها من المخزن (تنبيه لمرة واحدة)."""
+def pop_triggered(store: dict, price_of) -> list[tuple[Alert, Decimal]]:
+    """يسحب التنبيهات اللي تحققت ويحذفها من المخزن (تنبيه لمرة واحدة).
+
+    `price_of(alert)` يرجّع السعر بعملة التنبيه، أو None إذا تعذّر تسعيره —
+    وقتها نبقيه في المخزن بدل ما نحذفه أو نطلقه على سعر خاطئ.
+    """
     alerts = store.setdefault("alerts", [])
     fired, remaining = [], []
 
     for alert in alerts:
-        price = price_for_karat(alert.karat)
-        if alert.triggered_by(price):
+        price = price_of(alert)
+        if price is not None and alert.triggered_by(price):
             fired.append((alert, price))
         else:
             remaining.append(alert)

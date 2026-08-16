@@ -21,6 +21,7 @@ import asyncio
 import os
 import logging
 from dataclasses import dataclass, replace
+from functools import partial
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Callable
@@ -46,7 +47,8 @@ CLOSES_TTL = timedelta(hours=1)  # الإغلاقات اليومية رقم يو
 
 # حدود منطقية
 GOLD_RANGE = (Decimal("100"), Decimal("100000"))  # دولار للأونصة
-FX_RANGE = (Decimal("0.5"), Decimal("100"))  # ريال للدولار
+# وحدات العملة مقابل الدولار: يشمل الدينار الكويتي (٠٫٣٠٨) والجنيه المصري (٥٠)
+FX_RANGE = (Decimal("0.1"), Decimal("10000"))
 
 # الذهب لا يقفز ٣٪ خلال نصف ساعة — أي مصدر يقول غير ذلك يُتجاوَز
 MAX_JUMP_PCT = Decimal("3")
@@ -116,14 +118,20 @@ def parse_fxratesapi(data: dict) -> Reading:
     return _validate(1 / per_usd, GOLD_RANGE), None
 
 
-def parse_er_api(data: dict) -> Reading:
+def parse_er_api(data: dict, code: str = "SAR") -> Reading:
     if data.get("result") != "success":
         raise ValueError("المصدر رجّع حالة فشل")
-    return _validate(_to_decimal(data["rates"]["SAR"]), FX_RANGE), None
+    rate = data["rates"].get(code)
+    if rate is None:
+        raise ValueError(f"المصدر ما يعرف العملة {code}")
+    return _validate(_to_decimal(rate), FX_RANGE), None
 
 
-def parse_currency_api(data: dict) -> Reading:
-    return _validate(_to_decimal(data["usd"]["sar"]), FX_RANGE), None
+def parse_currency_api(data: dict, code: str = "SAR") -> Reading:
+    rate = data["usd"].get(code.lower())
+    if rate is None:
+        raise ValueError(f"المصدر ما يعرف العملة {code}")
+    return _validate(_to_decimal(rate), FX_RANGE), None
 
 
 # ---------- المصادر بالترتيب ----------
@@ -164,7 +172,7 @@ DAILY_CLOSES_URL = (
 
 _last: dict[str, Quote] = {}  # آخر قيمة معروفة — للطوارئ وفحص القفزات
 _inflight: dict[str, asyncio.Task] = {}  # الطلبات الجارية
-_fx_cache: Quote | None = None
+_fx_cache: dict[str, Quote] = {}
 _closes_cache: tuple[list[tuple[date, Decimal]], datetime] | None = None
 _closes_lock: asyncio.Lock | None = None
 
@@ -254,26 +262,35 @@ async def gold_usd_per_ounce() -> Quote:
         return replace(previous, stale=True)
 
 
-async def usd_to_sar() -> Quote:
-    """سعر صرف الدولار بالريال.
+async def usd_to(code: str = "SAR") -> Quote:
+    """سعر صرف الدولار بالعملة المطلوبة.
 
-    مخزَّن ٦ ساعات عن قصد: الريال مربوط والمصدر يحدّث يومياً، فجلبه مع كل رسالة
-    يضاعف الطلبات بلا فائدة. طزاجة سعر الذهب هي المهمة، وهي غير مخزَّنة.
+    مخزَّن ٦ ساعات عن قصد: أغلب عملات المنطقة مربوطة والمصدر يحدّث يومياً،
+    فجلبه مع كل رسالة يضاعف الطلبات بلا فائدة. طزاجة سعر الذهب هي المهمة،
+    وهي غير مخزَّنة.
     """
-    global _fx_cache
+    code = code.upper()
+    cached = _fx_cache.get(code)
+    if cached is not None and cached.age < FX_TTL and not cached.stale:
+        return cached
 
-    if _fx_cache is not None and _fx_cache.age < FX_TTL and not _fx_cache.stale:
-        return _fx_cache
-
+    sources = tuple(
+        (name, url, partial(parser, code=code)) for name, url, parser in FX_SOURCES
+    )
     try:
-        quote = await _shared("fx", FX_SOURCES, FX_TIMEOUT)
+        quote = await _shared(f"fx:{code}", sources, FX_TIMEOUT)
     except RuntimeError:
-        if _fx_cache is None:
+        if cached is None:
             raise
-        return replace(_fx_cache, stale=True)
+        return replace(cached, stale=True)
 
-    _fx_cache = quote
+    _fx_cache[code] = quote
     return quote
+
+
+async def usd_to_sar() -> Quote:
+    """اختصار متوافق مع الاستخدام القديم."""
+    return await usd_to("SAR")
 
 
 # ---------- الإغلاقات اليومية (للتغيّر اليومي) ----------
@@ -369,8 +386,8 @@ async def change_pct(
 
 
 def clear_cache() -> None:
-    global _fx_cache, _closes_cache
+    global _closes_cache
     _last.clear()
     _inflight.clear()
-    _fx_cache = None
+    _fx_cache.clear()
     _closes_cache = None

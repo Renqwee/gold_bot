@@ -16,6 +16,8 @@ from telegram import (
     BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
     KeyboardButton,
     MenuButtonCommands,
     ReplyKeyboardMarkup,
@@ -29,12 +31,14 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    InlineQueryHandler,
     MessageHandler,
     PicklePersistence,
     filters,
 )
 
 import alerts as alerts_store
+import currencies
 import health
 import market
 import rates
@@ -85,6 +89,7 @@ TOKEN_PATTERN = re.compile(r"\d{6,}:[A-Za-z0-9_-]{30,}")
 LAST_OUNCE = "last_ounce"
 PINNED_RATE = "pinned_rate"  # موجود = المستخدم ثبّت سعر الصرف يدوياً
 FAV_KARAT = "fav_karat"
+CURRENCY = "currency"
 
 # مفاتيح bot_data
 MONITOR = "health_monitor"
@@ -141,11 +146,15 @@ def site_button(label: str = "📖 دليل الاستخدام") -> InlineKeyboa
 
 
 def weights_block(
-    ounce: Decimal, karat: int, usd_sar: Decimal, weights=COMMON_WEIGHTS
+    ounce: Decimal,
+    karat: int,
+    usd_sar: Decimal,
+    cur: currencies.Currency = currencies.DEFAULT,
+    weights=COMMON_WEIGHTS,
 ) -> str:
     """جدول أسعار الأوزان الشائعة: ٥٠ و١٠٠ و٢٥٠ جرام والكيلو."""
     rows = "\n".join(
-        f"{weight_label(grams):>10} │ {fmt_money(total):>12} ريال"
+        f"{weight_label(grams):>10} │ {money_big(total, cur):>12} {cur.name}"
         for grams, total in weight_table(ounce, karat, usd_sar, weights)
     )
     return f"<b>الأوزان — عيار {karat}</b>\n<pre>{rows}</pre>"
@@ -173,6 +182,21 @@ def escape(text: str) -> str:
 
 def fav_karat(context: ContextTypes.DEFAULT_TYPE) -> int:
     return context.chat_data.get(FAV_KARAT, DEFAULT_KARAT)
+
+
+def chat_currency(context: ContextTypes.DEFAULT_TYPE) -> currencies.Currency:
+    code = context.chat_data.get(CURRENCY, currencies.DEFAULT_CODE)
+    return currencies.CURRENCIES.get(code, currencies.DEFAULT)
+
+
+def money(value: Decimal, cur: currencies.Currency) -> str:
+    """مبلغ بخانات عملته — الدينار ثلاث خانات والريال خانتان."""
+    return fmt(value, cur.decimals)
+
+
+def money_big(value: Decimal, cur: currencies.Currency) -> str:
+    """المبالغ الكبيرة بلا كسور — الهللة تفرق في ١٢ جرام مو في كيلو."""
+    return fmt(value, 0) if abs(value) >= 10_000 else money(value, cur)
 
 
 def is_private(update: Update) -> bool:
@@ -235,16 +259,21 @@ def freshness(quote: rates.Quote) -> str:
 
 
 async def get_rate(context: ContextTypes.DEFAULT_TYPE) -> tuple[Decimal, str]:
-    """سعر الصرف: المثبّت يدوياً، وإلا مباشر من الإنترنت، وإلا الربط الرسمي."""
+    """سعر صرف الدولار بعملة المحادثة، مع مصدره."""
+    cur = chat_currency(context)
+
     pinned = context.chat_data.get(PINNED_RATE)
     if pinned is not None:
         return pinned, f"مثبّت يدوياً ({fmt(pinned, 4)})"
 
     try:
-        quote = await rates.usd_to_sar()
+        quote = await rates.usd_to(cur.code)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("تعذّر جلب سعر الصرف: %s", exc)
-        return DEFAULT_USD_SAR, f"الربط الرسمي ({fmt(DEFAULT_USD_SAR, 2)})"
+        logger.warning("تعذّر جلب صرف %s: %s", cur.code, exc)
+        if cur.peg is None:
+            # عملة عائمة أو مربوطة بسلة: رقم مخمَّن يضلّل أكثر مما يفيد
+            raise
+        return cur.peg, f"الربط الرسمي ({fmt(cur.peg, 4)})"
 
     note = "قديم" if quote.stale else clock(quote.fetched_at)
     return quote.value, f"{fmt(quote.value, 4)} • {note}"
@@ -309,12 +338,13 @@ async def build_live_message(context: ContextTypes.DEFAULT_TYPE) -> str:
     """نص رسالة الأسعار المباشرة لكل العيارات."""
     quote = await rates.gold_usd_per_ounce()
     usd_sar, rate_label = await get_rate(context)
+    cur = chat_currency(context)
     context.chat_data[LAST_OUNCE] = quote.value
 
     favorite = fav_karat(context)
     state = market_state(quote)
     rows = "\n".join(
-        f"{'⭐' if karat == favorite else '  '} عيار {karat:>2} │ {fmt(price):>10} ريال"
+        f"{'⭐' if karat == favorite else '  '} عيار {karat:>2} │ {money(price, cur):>10} {cur.name}"
         for karat, price in all_prices(quote.value, usd_sar)
     )
     warning = "\n⚠️ <b>تعذّر الوصول للمصادر — السعر قديم</b>" if quote.stale else ""
@@ -378,16 +408,18 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if action == "karat":
         karat = int(payload)
         usd_sar, _ = await get_rate(context)
+        cur = chat_currency(context)
         price = gram_price(ounce, karat, usd_sar)
-        await query.answer(f"عيار {karat}: {fmt(price)} ريال للجرام", show_alert=True)
+        await query.answer(f"عيار {karat}: {money(price, cur)} {cur.name} للجرام", show_alert=True)
         return
 
     if action == "weights":
         await query.answer()
         karat = fav_karat(context)
         usd_sar, _ = await get_rate(context)
+        cur = chat_currency(context)
         await query.message.reply_text(
-            f"{weights_block(ounce, karat, usd_sar)}"
+            f"{weights_block(ounce, karat, usd_sar, cur)}"
             f"<i>الأونصة: ${fmt(ounce)} • لعيار ثاني: /bars 24</i>",
             parse_mode=ParseMode.HTML,
         )
@@ -405,11 +437,13 @@ async def karat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     usd_sar, rate_label = await get_rate(context)
+
+    cur = chat_currency(context)
     price = gram_price(ounce, karat, usd_sar)
 
     await update.message.reply_text(
         f"<b>عيار {karat}</b>\n"
-        f"سعر الجرام: <b>{fmt(price)}</b> ريال\n\n"
+        f"سعر الجرام: <b>{money(price, cur)}</b> {cur.name}\n\n"
         f"<i>الأونصة: ${fmt(ounce)} • النقاء: {fmt(purity(karat) * 100)}%</i>\n"
         f"<i>الدولار: {escape(rate_label)}</i>",
         parse_mode=ParseMode.HTML,
@@ -428,15 +462,16 @@ async def send_all(
 ) -> None:
     """سعر الجرام لكل العيارات + جدول الأوزان للعيار المفضل."""
     usd_sar, rate_label = await get_rate(context)
+    cur = chat_currency(context)
     favorite = fav_karat(context)
 
     rows = "\n".join(
-        f"{'⭐' if karat == favorite else '  '} عيار {karat:>2} │ {fmt(price):>10} ريال"
+        f"{'⭐' if karat == favorite else '  '} عيار {karat:>2} │ {money(price, cur):>10} {cur.name}"
         for karat, price in all_prices(ounce, usd_sar)
     )
 
     await update.message.reply_text(
-        f"<b>💱 الأونصة ${fmt(ounce)} = سعر الجرام بالريال</b>\n"
+        f"<b>💱 الأونصة ${fmt(ounce)} = سعر الجرام بـ{cur.name}</b>\n"
         f"<pre>{rows}</pre>"
         f"{weights_block(ounce, favorite, usd_sar)}"
         f"<i>الدولار: {escape(rate_label)} • بدون مصنعية أو ضريبة</i>\n"
@@ -449,7 +484,7 @@ async def gram_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """/gram <سعر الأونصة بالدولار> — التحويل اليدوي الصريح."""
     if not context.args:
         await update.message.reply_text(
-            "أعطني سعر الأونصة بالدولار وأحوّله لسعر الجرام بالريال.\n\n"
+            f"أعطني سعر الأونصة بالدولار وأحوّله لسعر الجرام بـ{chat_currency(context).name}.\n\n"
             "مثال: <code>/gram 4380</code>\n"
             "<i>أو أرسل الرقم لحاله بدون أمر.</i>\n"
             "<i>للسعر المباشر بدون ما تعطيني رقم: /now</i>",
@@ -487,13 +522,15 @@ async def bars_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     usd_sar, _ = await get_rate(context)
+
+    cur = chat_currency(context)
     per_gram = gram_price(ounce, karat, usd_sar)
 
     await update.message.reply_text(
         f"<b>🧱 أسعار الأوزان</b>\n"
         f"{market_line(market_state())}\n\n"
-        f"{weights_block(ounce, karat, usd_sar)}"
-        f"<i>سعر الجرام: {fmt(per_gram)} ريال • الأونصة: ${fmt(ounce)}</i>\n"
+        f"{weights_block(ounce, karat, usd_sar, cur)}"
+        f"<i>سعر الجرام: {money(per_gram, cur)} {cur.name} • الأونصة: ${fmt(ounce)}</i>\n"
         f"<i>لعيار ثاني: /bars 21 • لوزن غير هذي: /w 37.5 21</i>",
         parse_mode=ParseMode.HTML,
     )
@@ -530,13 +567,15 @@ async def weight_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     usd_sar, _ = await get_rate(context)
+
+    cur = chat_currency(context)
     total = weight_value(ounce, karat, grams, usd_sar)
     per_gram = gram_price(ounce, karat, usd_sar)
 
     await update.message.reply_text(
         f"<b>{fmt(grams, 3)} جرام • عيار {karat}</b>\n"
-        f"القيمة: <b>{fmt_money(total)}</b> ريال\n\n"
-        f"<i>سعر الجرام: {fmt(per_gram)} ريال • الأونصة: ${fmt(ounce)}</i>",
+        f"القيمة: <b>{money_big(total, cur)}</b> {cur.name}\n\n"
+        f"<i>سعر الجرام: {money(per_gram, cur)} {cur.name} • الأونصة: ${fmt(ounce)}</i>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -577,6 +616,8 @@ async def shop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     usd_sar, _ = await get_rate(context)
+
+    cur = chat_currency(context)
     market = gram_price(ounce, karat, usd_sar)
     b = shop_breakdown(shop_price, market, vat_applies=not exempt)
 
@@ -588,12 +629,12 @@ async def shop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if b.making >= 0:
         verdict = (
-            f"<b>المصنعية الفعلية: {fmt(b.making)} ريال للجرام</b>\n"
+            f"<b>المصنعية الفعلية: {money(b.making, cur)} {cur.name} للجرام</b>\n"
             f"<i>أي {fmt(b.making_pct)}% فوق سعر الذهب</i>"
         )
     else:
         verdict = (
-            f"<b>⚠️ أقل من سعر الذهب بـ {fmt(-b.making)} ريال</b>\n"
+            f"<b>⚠️ أقل من سعر الذهب بـ {money(-b.making, cur)} {cur.name}</b>\n"
             f"<i>تأكد من العيار — أو يمكن يكون سعر شراء لا بيع.</i>"
         )
 
@@ -642,11 +683,13 @@ async def ounce_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     usd_sar, _ = await get_rate(context)
+
+    cur = chat_currency(context)
     ounce = ounce_from_gram(gram_sar, karat, usd_sar)
 
     await update.message.reply_text(
         f"<b>العملية العكسية</b>\n"
-        f"جرام عيار {karat} بـ {fmt(gram_sar)} ريال\n"
+        f"جرام عيار {karat} بـ {money(gram_sar, cur)} {cur.name}\n"
         f"= أونصة بـ <b>${fmt(ounce)}</b>",
         parse_mode=ParseMode.HTML,
     )
@@ -682,13 +725,15 @@ async def zakat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     usd_sar, _ = await get_rate(context)
+
+    cur = chat_currency(context)
     reached, pure_grams, value, due = zakat(ounce, karat, grams, usd_sar)
 
     if reached:
         verdict = (
             f"✅ بلغ النصاب\n"
-            f"الزكاة: <b>{fmt(due)}</b> ريال\n"
-            f"<i>(٢٫٥٪ من {fmt(value)} ريال)</i>"
+            f"الزكاة: <b>{money_big(due, cur)}</b> {cur.name}\n"
+            f"<i>(٢٫٥٪ من {money_big(value, cur)} {cur.name})</i>"
         )
     else:
         short = ZAKAT_NISAB_GRAMS_24K - pure_grams
@@ -701,7 +746,7 @@ async def zakat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"<b>زكاة الذهب</b>\n"
         f"{fmt(grams, 3)} جرام عيار {karat}\n"
         f"= {fmt(pure_grams, 3)} جرام ذهب خالص\n"
-        f"القيمة: {fmt(value)} ريال\n\n"
+        f"القيمة: {money_big(value, cur)} {cur.name}\n\n"
         f"{verdict}\n\n"
         f"<i>النصاب {ZAKAT_NISAB_GRAMS_24K} جرام خالص، والزكاة تجب بعد حَوَلان الحول. "
         f"هذا حساب تقريبي — للفتوى راجع أهل العلم.</i>",
@@ -736,6 +781,8 @@ async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     usd_sar, _ = await get_rate(context)
+
+    cur = chat_currency(context)
     current = gram_price(ounce, karat, usd_sar)
     direction = alerts_store.direction_for(target, current)
 
@@ -744,6 +791,7 @@ async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         karat=karat,
         target=target,
         direction=direction,
+        currency=cur.code,
     )
     if not alerts_store.add(context.bot_data, alert):
         await update.message.reply_text(
@@ -755,8 +803,8 @@ async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     word = "يطلع فوق" if direction == alerts_store.ABOVE else "ينزل تحت"
     await update.message.reply_text(
         f"🔔 <b>تم</b>\n"
-        f"أنبّهك لما جرام عيار {karat} {word} <b>{fmt(target)}</b> ريال.\n\n"
-        f"<i>السعر الآن: {fmt(current)} ريال • أفحص كل "
+        f"أنبّهك لما جرام عيار {karat} {word} <b>{money(target, cur)}</b> {cur.name}.\n\n"
+        f"<i>السعر الآن: {money(current, cur)} {cur.name} • أفحص كل "
         f"{alerts_store.CHECK_INTERVAL_SECONDS // 60} دقائق</i>",
         parse_mode=ParseMode.HTML,
     )
@@ -769,7 +817,7 @@ async def show_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(
             "ما عندك تنبيهات.\n\n"
             "لإضافة واحد: <code>/alert 460 21</code>\n"
-            "<i>ينبّهك لما جرام عيار ٢١ يوصل ٤٦٠ ريال — طالعاً أو نازلاً.</i>",
+            f"<i>ينبّهك لما جرام عيار ٢١ يوصل ٤٦٠ {chat_currency(context).name} — طالعاً أو نازلاً.</i>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -838,19 +886,39 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:  # noqa: BLE001
         usd_sar = DEFAULT_USD_SAR
 
-    fired = alerts_store.pop_triggered(
-        context.bot_data,
-        lambda karat: gram_price(quote.value, karat, usd_sar),
-    )
+    # سعر الصرف بالدولار لكل عملة نحتاجها — التنبيه يُرسل بعملة صاحبه
+    chat_rates: dict[str, Decimal] = {}
+    for pending in list(context.bot_data.get("alerts", [])):
+        code = pending.currency or currencies.DEFAULT_CODE
+        if code in chat_rates:
+            continue
+        try:
+            chat_rates[code] = (await rates.usd_to(code)).value
+        except Exception:  # noqa: BLE001
+            fallback = currencies.CURRENCIES.get(code, currencies.DEFAULT).peg
+            if fallback is None:
+                continue  # عملة عائمة وما قدرنا نجيب سعرها: نأجّل التنبيه
+            chat_rates[code] = fallback
+
+    def price_for(alert) -> Decimal | None:
+        rate = chat_rates.get(alert.currency or currencies.DEFAULT_CODE)
+        if rate is None:
+            return None
+        return gram_price(quote.value, alert.karat, rate)
+
+    fired = alerts_store.pop_triggered(context.bot_data, price_for)
 
     for alert, price in fired:
+        cur = currencies.CURRENCIES.get(
+            alert.currency or currencies.DEFAULT_CODE, currencies.DEFAULT
+        )
         try:
             await context.bot.send_message(
                 chat_id=alert.chat_id,
                 text=(
                     f"🔔 <b>تنبيه سعر</b>\n"
-                    f"{alert.arrow} جرام عيار {alert.karat} صار <b>{fmt(price)}</b> ريال\n"
-                    f"<i>هدفك كان {fmt(alert.target)} ريال</i>\n\n"
+                    f"{alert.arrow} جرام عيار {alert.karat} صار <b>{money(price, cur)}</b> {cur.name}\n"
+                    f"<i>هدفك كان {money(alert.target, cur)} {cur.name}</i>\n\n"
                     f"<i>الأونصة: ${fmt(quote.value)}</i>"
                 ),
                 parse_mode=ParseMode.HTML,
@@ -917,6 +985,51 @@ async def record_close(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------- الإعدادات ----------
 
 
+async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/currency [رمز] — عملة العرض لهذي المحادثة."""
+    current = chat_currency(context)
+
+    if not context.args:
+        rows = "\n".join(
+            f"{'✅' if c.code == current.code else '  '} {c.flag} {c.code} — {c.name}"
+            for c in currencies.CURRENCIES.values()
+        )
+        await update.message.reply_text(
+            f"<b>عملتك: {current.label}</b>\n\n{rows}\n\n"
+            f"للتغيير: <code>/currency AED</code> أو <code>/currency درهم</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    chosen = currencies.resolve(" ".join(context.args))
+    if chosen is None:
+        codes = " · ".join(currencies.CURRENCIES)
+        await update.message.reply_text(
+            f"⚠️ ما عرفت هذي العملة.\nالمتاح: <code>{codes}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    context.chat_data[CURRENCY] = chosen.code
+    context.chat_data.pop(PINNED_RATE, None)  # السعر المثبّت كان لعملة ثانية
+
+    try:
+        rate, label = await get_rate(context)
+    except Exception:  # noqa: BLE001
+        await update.message.reply_text(
+            f"✅ عملتك صارت {chosen.label}\n"
+            f"⚠️ لكن ما قدرت أجيب سعر صرفها الآن — جرّب بعد شوي.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await update.message.reply_text(
+        f"✅ عملتك صارت <b>{chosen.label}</b>\n"
+        f"<i>1 دولار = {fmt(rate, 4)} {chosen.name} • {escape(label)}</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def fav_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/fav <العيار> — العيار المفضل، يُستخدم كافتراضي في باقي الأوامر."""
     if not context.args:
@@ -955,11 +1068,13 @@ async def my_karat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     usd_sar, _ = await get_rate(context)
+
+    cur = chat_currency(context)
     price = gram_price(ounce, karat, usd_sar)
 
     await update.message.reply_text(
         f"⭐ <b>عيار {karat}</b>\n"
-        f"<b>{fmt(price)}</b> ريال للجرام\n"
+        f"<b>{money(price, cur)}</b> {cur.name} للجرام\n"
         f"{market_line(market_state())}\n\n"
         f"<i>الأونصة: ${fmt(ounce)}</i>\n"
         f"<i>لتغيير عيارك: /fav</i>",
@@ -971,10 +1086,11 @@ async def my_karat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def rate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cur = chat_currency(context)
     if not context.args:
         value, label = await get_rate(context)
         await update.message.reply_text(
-            f"سعر الصرف الحالي: <b>{fmt(value, 4)}</b> ريال للدولار\n"
+            f"سعر الصرف الحالي: <b>{fmt(value, 4)}</b> {cur.name} للدولار\n"
             f"المصدر: {escape(label)}\n\n"
             f"<code>/rate auto</code> — تلقائي من الإنترنت\n"
             f"<code>/rate 3.7502</code> — تثبيت قيمة يدوياً",
@@ -1000,7 +1116,7 @@ async def rate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     context.chat_data[PINNED_RATE] = new_rate
     await update.message.reply_text(
-        f"✅ ثبّتُّ سعر الصرف على <b>{fmt(new_rate, 4)}</b> ريال للدولار\n"
+        f"✅ ثبّتُّ سعر الصرف على <b>{fmt(new_rate, 4)}</b> {cur.name} للدولار\n"
         f"<i>للرجوع للتلقائي: /rate auto</i>",
         parse_mode=ParseMode.HTML,
     )
@@ -1121,6 +1237,8 @@ async def interpret(
         context.chat_data[LAST_OUNCE] = ounce
 
     usd_sar, _ = await get_rate(context)
+
+    cur = chat_currency(context)
     karat = query.karat or fav_karat(context)
 
     # وزن مذكور → قيمته
@@ -1130,8 +1248,8 @@ async def interpret(
         guessed = "" if query.karat else f"\n<i>افترضت عيار {karat} — غيّره بـ /fav</i>"
         return await update.message.reply_text(
             f"<b>{weight_label(query.grams)} • عيار {karat}</b>\n"
-            f"<b>{fmt_money(total)}</b> ريال\n\n"
-            f"<i>سعر الجرام: {fmt(per_gram)} ريال • الأونصة: ${fmt(ounce)}</i>{guessed}",
+            f"<b>{money_big(total, cur)}</b> {cur.name}\n\n"
+            f"<i>سعر الجرام: {money(per_gram, cur)} {cur.name} • الأونصة: ${fmt(ounce)}</i>{guessed}",
             parse_mode=ParseMode.HTML,
         )
 
@@ -1140,9 +1258,9 @@ async def interpret(
         per_gram = gram_price(ounce, karat, usd_sar)
         return await update.message.reply_text(
             f"<b>عيار {karat}</b>\n"
-            f"<b>{fmt(per_gram)}</b> ريال للجرام\n"
+            f"<b>{money(per_gram, cur)}</b> {cur.name} للجرام\n"
             f"{market_line(market_state())}\n\n"
-            f"{weights_block(ounce, karat, usd_sar)}"
+            f"{weights_block(ounce, karat, usd_sar, cur)}"
             f"<i>الأونصة: ${fmt(ounce)}</i>",
             parse_mode=ParseMode.HTML,
         )
@@ -1155,7 +1273,7 @@ async def interpret(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "<b>أهلاً 👋</b>\n"
-        "أعطيك سعر الذهب بالريال — بكل بساطة.\n\n"
+        f"أعطيك سعر الذهب بـ{chat_currency(context).name} — بكل بساطة.\n\n"
         "<b>اكتب لي عادي، وأنا أفهمك:</b>\n"
         "• <code>12 جرام عيار 21</code> ← قيمة الوزن\n"
         "• <code>نص كيلو</code> ← قيمة نص كيلو\n"
@@ -1203,6 +1321,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "<code>/shop 420 21</code> — يقارن سعر المحل بالسوق\n"
         "<code>/zakat 100 21</code> — زكاة الذهب (نصاب ٨٥ جرام، ٢٫٥٪)\n"
         "<code>/ounce 358.68 21</code> — من سعر الجرام لسعر الأونصة\n\n"
+        "<b>في أي محادثة</b>\n"
+        "اكتب <code>@اسم_البوت 12 جرام 21</code> في أي قروب أو خاص، "
+        "واختر النتيجة لترسلها — بدون ما تفتح البوت.\n\n"
         "<b>التنبيهات</b>\n"
         "<code>/alert 460 21</code> — نبّهني لما يوصل الجرام ٤٦٠ ريال\n"
         "/alerts — تنبيهاتي • <code>/unalert 1</code> — حذف واحد\n"
@@ -1210,6 +1331,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"والتنبيه يُرسل مرة وحدة ثم ينحذف.</i>\n\n"
         "<b>الإعدادات</b>\n"
         "<code>/fav 22</code> — عيارك المفضل (الافتراضي في باقي الأوامر)\n"
+        "<code>/currency AED</code> — عملة العرض (٩ عملات)\n"
         "<code>/rate auto</code> — سعر الصرف تلقائي من الإنترنت\n"
         "<code>/rate 3.7502</code> — تثبيته يدوياً\n\n"
         "<b>عن الأسعار</b>\n"
@@ -1253,6 +1375,91 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+# ---------- الوضع المضمّن ----------
+
+
+async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """‏@البوت داخل أي محادثة: يفهم نفس لغة الرسائل العادية.
+
+    الوضع المضمّن لا يملك chat_data، فالعملة والعيار افتراضيان دائماً —
+    ولهذا كل نتيجة تذكر عيارها وعملتها صراحةً.
+    """
+    query = (update.inline_query.query or "").strip()
+
+    try:
+        quote = await rates.gold_usd_per_ounce()
+        usd_rate = await rates.usd_to(currencies.DEFAULT_CODE)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("الوضع المضمّن: تعذّر جلب السعر (%s)", exc)
+        return await update.inline_query.answer([], cache_time=10)
+
+    cur = currencies.DEFAULT
+    ounce, usd_sar = quote.value, usd_rate.value
+    state = market_state(quote)
+    footer = market_line(state)
+
+    parsed = nlp.understand(query) if query else nlp.Query()
+    karat = parsed.karat or DEFAULT_KARAT
+    results = []
+
+    if parsed.grams is not None:
+        total = weight_value(ounce, karat, parsed.grams, usd_sar)
+        results.append(
+            InlineQueryResultArticle(
+                id=f"w{karat}",
+                title=f"{weight_label(parsed.grams)} عيار {karat}",
+                description=f"{money_big(total, cur)} {cur.name}",
+                input_message_content=InputTextMessageContent(
+                    f"<b>{weight_label(parsed.grams)} • عيار {karat}</b>\n"
+                    f"<b>{money_big(total, cur)}</b> {cur.name}\n\n"
+                    f"<i>سعر الجرام: {money(gram_price(ounce, karat, usd_sar), cur)} "
+                    f"{cur.name} • الأونصة: ${fmt(ounce)}</i>\n<i>{footer}</i>",
+                    parse_mode=ParseMode.HTML,
+                ),
+            )
+        )
+
+    # جدول كامل دائماً كخيار أول أو أخير
+    rows = "\n".join(
+        f"عيار {k:>2} │ {money(p, cur):>10} {cur.name}"
+        for k, p in all_prices(ounce, usd_sar)
+    )
+    results.append(
+        InlineQueryResultArticle(
+            id="all",
+            title="كل العيارات",
+            description=f"الأونصة ${fmt(ounce)} • عيار 21: "
+            f"{money(gram_price(ounce, 21, usd_sar), cur)}",
+            input_message_content=InputTextMessageContent(
+                f"<b>🟡 سعر جرام الذهب</b>\n<pre>{rows}</pre>"
+                f"<i>الأونصة: ${fmt(ounce)} • {escape(quote.source)}</i>\n"
+                f"<i>{footer}</i>",
+                parse_mode=ParseMode.HTML,
+            ),
+        )
+    )
+
+    for k in (24, 22, 21, 18):
+        price = gram_price(ounce, k, usd_sar)
+        results.append(
+            InlineQueryResultArticle(
+                id=f"k{k}",
+                title=f"عيار {k}",
+                description=f"{money(price, cur)} {cur.name} للجرام",
+                input_message_content=InputTextMessageContent(
+                    f"<b>عيار {k}</b>\n<b>{money(price, cur)}</b> {cur.name} للجرام\n\n"
+                    f"<i>الأونصة: ${fmt(ounce)}</i>\n<i>{footer}</i>",
+                    parse_mode=ParseMode.HTML,
+                ),
+            )
+        )
+
+    # السوق مقفل = السعر مجمّد، فالتخزين أطول بلا ضرر
+    await update.inline_query.answer(
+        results, cache_time=300 if not state.is_open else 30, is_personal=False
+    )
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("خطأ أثناء المعالجة:", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
@@ -1273,6 +1480,7 @@ async def post_init(application: Application) -> None:
             BotCommand("alerts", "قائمة تنبيهاتي"),
             BotCommand("zakat", "🕌 زكاة الذهب"),
             BotCommand("fav", "⭐ عياري المفضل"),
+            BotCommand("currency", "💱 عملة العرض"),
             BotCommand("ounce", "من الجرام إلى الأونصة"),
             BotCommand("rate", "سعر صرف الدولار"),
             BotCommand("sources", "حالة المصادر والسوق"),
@@ -1353,11 +1561,13 @@ def main() -> None:
     app.add_handler(CommandHandler("alerts", show_alerts))
     app.add_handler(CommandHandler("unalert", unalert_command))
     app.add_handler(CommandHandler("fav", fav_command))
+    app.add_handler(CommandHandler("currency", currency_command))
     app.add_handler(CommandHandler("rate", rate_command))
     app.add_handler(CommandHandler("sources", sources_command))
     for karat in KARATS:
         app.add_handler(CommandHandler(f"k{karat}", karat_command))
     app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(InlineQueryHandler(inline_query))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_number))
     app.add_error_handler(on_error)
 
