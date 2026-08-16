@@ -2,6 +2,7 @@
 
 كل العمليات بـ Decimal تجنّباً لأخطاء الفاصلة العائمة.
 """
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP, getcontext
 
 getcontext().prec = 34
@@ -108,6 +109,65 @@ def zakat(
     value = weight_value(ounce_usd, karat, grams, usd_sar)
     due = value * ZAKAT_RATE if reached else Decimal(0)
     return reached, pure_grams, value, due
+
+
+# ---------- ضريبة القيمة المضافة ----------
+
+# السعودية: ١٥٪ على المشغولات الذهبية، وصفر على الذهب الاستثماري
+# (نقاء ٩٩٪ فأعلى وقابل للتداول في سوق السبائك العالمية).
+VAT_RATE = Decimal("0.15")
+INVESTMENT_GOLD_MIN_PURITY = Decimal("0.99")
+
+
+def is_investment_purity(karat: int) -> bool:
+    """هل نقاء هذا العيار يبلغ حدّ الذهب الاستثماري؟
+
+    عيار ٢٤ وحده يتجاوز ٩٩٪. والإعفاء مشروط بكونه سبيكة قابلة للتداول عالمياً،
+    فسوار عيار ٢٤ يبقى مشغولاً وعليه ضريبة.
+    """
+    return purity(karat) >= INVESTMENT_GOLD_MIN_PURITY
+
+
+@dataclass(frozen=True)
+class ShopBreakdown:
+    """تفكيك سعر المحل إلى ذهب وضريبة ومصنعية."""
+
+    shop_price: Decimal  # ما يطلبه المحل للجرام، شامل كل شيء
+    market_price: Decimal  # سعر الذهب الخام
+    vat: Decimal  # مبلغ الضريبة داخل السعر
+    net_price: Decimal  # سعر المحل بعد نزع الضريبة
+    making: Decimal  # المصنعية وهامش المحل
+    making_pct: Decimal  # نسبتها إلى سعر الذهب
+    vat_applies: bool
+
+
+def shop_breakdown(
+    shop_gram_sar: Decimal,
+    market_gram_sar: Decimal,
+    vat_applies: bool = True,
+) -> ShopBreakdown:
+    """يفصل سعر المحل: كم منه ذهب، وكم ضريبة، وكم مصنعية فعلية.
+
+    الضريبة مفروضة على **إجمالي** سعر البيع (ذهب + مصنعية) وهي داخلة في السعر
+    المعروض، فنستخرجها بالقسمة على ١٫١٥ — لا بضرب سعر الذهب في ٠٫١٥.
+    """
+    if vat_applies:
+        net = shop_gram_sar / (1 + VAT_RATE)
+        vat = shop_gram_sar - net
+    else:
+        net = shop_gram_sar
+        vat = Decimal(0)
+
+    making = net - market_gram_sar
+    return ShopBreakdown(
+        shop_price=shop_gram_sar,
+        market_price=market_gram_sar,
+        vat=vat,
+        net_price=net,
+        making=making,
+        making_pct=making / market_gram_sar * 100,
+        vat_applies=vat_applies,
+    )
 
 
 def premium(shop_gram_sar: Decimal, market_gram_sar: Decimal) -> tuple[Decimal, Decimal]:

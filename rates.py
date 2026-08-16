@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import logging
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
@@ -33,6 +34,11 @@ logger = logging.getLogger(__name__)
 SOURCE_TIMEOUT = 2.5
 FX_TIMEOUT = 6.0
 USER_AGENT = "GoldBot/2.0"
+
+# أرضية إعادة الجلب: حماية من الإغراق لا تخزين.
+# المصدر يحدّث كل بضع دقائق، فثانيتان لا تغيّران الرقم — لكنها تمنع مستخدماً
+# واحداً يرسل عشرات الرسائل من إطلاق عشرات الطلبات. صفر = عطّلها تماماً.
+MIN_REFETCH_INTERVAL = timedelta(seconds=float(os.environ.get("MIN_REFETCH_SECONDS", "2")))
 
 # سعر الصرف مربوط ويُحدَّث يومياً عند المصدر، فتخزينه لا يؤثر على طزاجة سعر الذهب
 FX_TTL = timedelta(hours=6)
@@ -221,14 +227,27 @@ async def _shared(key: str, sources: tuple[Source, ...], timeout: float) -> Quot
 
 
 async def gold_usd_per_ounce() -> Quote:
-    """سعر أونصة الذهب الفوري بالدولار — يُجلب مع كل استدعاء، بلا تخزين.
+    """سعر أونصة الذهب الفوري بالدولار — يُجلب مع كل استدعاء.
+
+    الاستثناء الوحيد أرضية `MIN_REFETCH_INTERVAL` (ثانيتان): حماية من الإغراق
+    لا تخزين. المصدر نفسه يحدّث كل بضع دقائق، فسعر عمره ثانيتان هو **نفس**
+    الرقم الذي سيرجّعه طلب جديد — بينما مستخدماً واحداً يرسل ٥٠ رسالة متتالية
+    كان سيطلق ٥٠ طلباً حقيقياً ويعرّض البوت للحظر.
 
     يرفع RuntimeError إذا فشلت كل المصادر وما فيه قيمة سابقة.
     """
+    previous = _last.get("gold")
+    if (
+        MIN_REFETCH_INTERVAL
+        and previous is not None
+        and not previous.stale
+        and previous.age < MIN_REFETCH_INTERVAL
+    ):
+        return previous
+
     try:
         return await _shared("gold", SPOT_SOURCES, SOURCE_TIMEOUT)
     except RuntimeError:
-        previous = _last.get("gold")
         if previous is None:
             raise
         logger.warning("كل المصادر فشلت — نرجّع قيمة عمرها %s", previous.age)

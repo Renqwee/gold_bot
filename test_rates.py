@@ -28,6 +28,21 @@ def clean():
     rates.clear_cache()
 
 
+def fake_fetch(calls, value="4380"):
+    """محاكاة لـ _fetch تسجّل آخر قيمة مثل الأصل.
+
+    بدون تسجيلها، أرضية إعادة الجلب ما تشتغل وتنجح الاختبارات لسبب خاطئ.
+    """
+
+    async def _inner(key, sources, timeout):
+        calls.append(1)
+        quote = Quote(Decimal(value), "test", datetime.now(timezone.utc))
+        rates._last[key] = quote
+        return quote
+
+    return _inner
+
+
 # ---------- المحلّلات ----------
 
 
@@ -149,14 +164,15 @@ def test_jump_guard_passes_when_no_history():
 
 @pytest.mark.asyncio
 async def test_every_call_fetches(monkeypatch):
-    """المطلوب: كل رسالة تجيب سعراً جديداً، لا تعيد استخدام قيمة مخزّنة."""
+    """المطلوب: كل رسالة تجيب سعراً جديداً، لا تعيد استخدام قيمة مخزّنة.
+
+    الأرضية معطّلة هنا عمداً — هي حماية من الإغراق، والسلوك الأساسي
+    الذي نتحقق منه هو الجلب مع كل استدعاء.
+    """
     calls = []
+    monkeypatch.setattr(rates, "_fetch", fake_fetch(calls))
+    monkeypatch.setattr(rates, "MIN_REFETCH_INTERVAL", timedelta(0))
 
-    async def counting(key, sources, timeout):
-        calls.append(1)
-        return Quote(Decimal("4380"), "test", datetime.now(timezone.utc))
-
-    monkeypatch.setattr(rates, "_fetch", counting)
     await rates.gold_usd_per_ounce()
     await rates.gold_usd_per_ounce()
     await rates.gold_usd_per_ounce()
@@ -301,3 +317,63 @@ def test_quote_ages():
 def test_quote_age_none_without_timestamp():
     quote = Quote(Decimal("4380"), "test", datetime.now(timezone.utc))
     assert quote.quote_age is None
+
+
+# ---------- أرضية إعادة الجلب (حماية من الإغراق) ----------
+
+
+@pytest.mark.asyncio
+async def test_refetch_floor_blocks_rapid_repeats(monkeypatch):
+    """مستخدم يرسل رسائل متتالية بسرعة = طلب واحد، مو طلب لكل رسالة."""
+    calls = []
+    monkeypatch.setattr(rates, "_fetch", fake_fetch(calls))
+    monkeypatch.setattr(rates, "MIN_REFETCH_INTERVAL", timedelta(seconds=2))
+
+    for _ in range(50):
+        await rates.gold_usd_per_ounce()
+
+    assert len(calls) == 1, "خمسون رسالة سريعة لازم تعطي طلباً واحداً"
+
+
+@pytest.mark.asyncio
+async def test_refetch_floor_expires(monkeypatch):
+    """بعد انقضاء الأرضية يعود الجلب الحقيقي — ما تحوّلت لتخزين دائم."""
+    calls = []
+    monkeypatch.setattr(rates, "_fetch", fake_fetch(calls))
+    monkeypatch.setattr(rates, "MIN_REFETCH_INTERVAL", timedelta(milliseconds=1))
+
+    await rates.gold_usd_per_ounce()
+    import asyncio
+    await asyncio.sleep(0.02)
+    await rates.gold_usd_per_ounce()
+
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_refetch_floor_can_be_disabled(monkeypatch):
+    """MIN_REFETCH_SECONDS=0 يعطّلها تماماً — جلب مع كل رسالة بلا استثناء."""
+    calls = []
+    monkeypatch.setattr(rates, "_fetch", fake_fetch(calls))
+    monkeypatch.setattr(rates, "MIN_REFETCH_INTERVAL", timedelta(0))
+
+    for _ in range(3):
+        await rates.gold_usd_per_ounce()
+
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_refetch_floor_never_serves_stale(monkeypatch):
+    """القيمة الموسومة «قديمة» لا تُعاد استخداماً عبر الأرضية — تُجرَّب المصادر."""
+    calls = []
+    monkeypatch.setattr(rates, "_fetch", fake_fetch(calls))
+    monkeypatch.setattr(rates, "MIN_REFETCH_INTERVAL", timedelta(seconds=60))
+    rates._last["gold"] = Quote(
+        Decimal("4300"), "test", datetime.now(timezone.utc), stale=True
+    )
+
+    quote = await rates.gold_usd_per_ounce()
+    assert len(calls) == 1
+    assert quote.value == Decimal("4380")
+    assert quote.stale is False

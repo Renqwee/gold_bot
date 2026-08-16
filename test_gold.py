@@ -11,8 +11,10 @@ from gold import (
     gram_price,
     ounce_from_gram,
     parse_number,
+    is_investment_purity,
     premium,
     purity,
+    shop_breakdown,
     quantize,
     weight_value,
 )
@@ -122,3 +124,53 @@ def test_parse_rejects_bad_input():
         except ParseError:
             continue
         raise AssertionError(f"لازم يرفض: {bad!r}")
+
+
+# ---------- تفكيك سعر المحل مع الضريبة ----------
+
+
+def test_vat_extracted_not_added():
+    """الضريبة داخلة في سعر المحل المعروض، فتُستخرج بالقسمة لا بالضرب.
+
+    الخطأ الشائع: ضرب سعر الذهب في ٠٫١٥. الصحيح أن الضريبة على إجمالي
+    البيع (ذهب + مصنعية)، فتُستخرج من السعر النهائي.
+    """
+    b = shop_breakdown(Decimal("115"), Decimal("80"))
+    assert quantize(b.net_price) == Decimal("100.00")
+    assert quantize(b.vat) == Decimal("15.00")
+    assert quantize(b.making) == Decimal("20.00")
+
+
+def test_breakdown_parts_sum_to_shop_price():
+    b = shop_breakdown(Decimal("600"), Decimal("461.66"))
+    assert quantize(b.market_price + b.making + b.vat) == quantize(b.shop_price)
+
+
+def test_exempt_bullion_has_no_vat():
+    b = shop_breakdown(Decimal("560"), Decimal("527.62"), vat_applies=False)
+    assert b.vat == 0
+    assert b.net_price == b.shop_price
+    assert quantize(b.making) == quantize(Decimal("560") - Decimal("527.62"))
+
+
+def test_vat_inflates_apparent_making_charge():
+    """بدون فصل الضريبة تبدو المصنعية أكبر بكثير — وهذا التضليل الذي نصلحه."""
+    shop, market = Decimal("600"), Decimal("461.66")
+    naive, _ = premium(shop, market)          # الطريقة القديمة
+    real = shop_breakdown(shop, market).making  # بعد نزع الضريبة
+    assert naive > real
+    assert quantize(naive - real) == quantize(shop_breakdown(shop, market).vat)
+
+
+def test_only_karat_24_reaches_investment_purity():
+    assert is_investment_purity(24) is True
+    for karat in KARATS:
+        if karat != 24:
+            assert is_investment_purity(karat) is False
+
+
+def test_shop_below_market_gives_negative_making():
+    """سعر أقل من الذهب الخام: غالباً سعر شراء لا بيع، أو عيار خاطئ."""
+    b = shop_breakdown(Decimal("300"), Decimal("461.66"))
+    assert b.making < 0
+    assert b.making_pct < 0

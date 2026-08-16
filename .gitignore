@@ -4,3 +4,4 @@ bot_state.pickle
 __pycache__/
 *.pyc
 .pytest_cache/
+source_measurements.csv

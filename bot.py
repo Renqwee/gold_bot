@@ -50,8 +50,11 @@ from gold import (
     gram_price,
     ounce_from_gram,
     parse_number,
+    VAT_RATE,
+    is_investment_purity,
     premium,
     purity,
+    shop_breakdown,
     quantize,
     weight_label,
     weight_table,
@@ -526,12 +529,13 @@ async def weight_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def shop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/shop <سعر المحل للجرام> <العيار> — كم المصنعية فوق سعر السوق."""
-    if len(context.args) != 2:
+    """/shop <سعر المحل> <العيار> [سبيكة] — يفصل سعر المحل إلى ذهب وضريبة ومصنعية."""
+    if len(context.args) < 2:
         await update.message.reply_text(
             "الاستخدام: <code>/shop سعر_الجرام_في_المحل العيار</code>\n"
-            "مثال: <code>/shop 420 21</code>\n"
-            "يقارن سعر المحل بسعر السوق ويحسب الفرق (المصنعية + الهامش).",
+            "مثال: <code>/shop 600 21</code>\n\n"
+            "أفصل لك السعر: كم منه ذهب، وكم ضريبة، وكم مصنعية فعلية.\n"
+            "<i>للسبائك أضف كلمة «سبيكة» — الذهب الاستثماري معفى من الضريبة.</i>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -549,25 +553,53 @@ async def shop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
+    # السبيكة معفاة فقط إذا بلغ نقاؤها حدّ الذهب الاستثماري
+    asked_bullion = any(
+        word in " ".join(context.args[2:]) for word in ("سبيكة", "سبائك", "bullion", "bar")
+    )
+    exempt = asked_bullion and is_investment_purity(karat)
+
     ounce = await live_or_last(update, context)
     if ounce is None:
         return
 
     usd_sar, _ = await get_rate(context)
     market = gram_price(ounce, karat, usd_sar)
-    diff, pct = premium(shop_price, market)
+    b = shop_breakdown(shop_price, market, vat_applies=not exempt)
 
-    if diff >= 0:
-        verdict = f"➕ فوق السوق بـ <b>{fmt(diff)}</b> ريال للجرام ({fmt(pct)}%)"
+    lines = [f"سعر المحل:        <b>{fmt(b.shop_price)}</b>"]
+    if b.vat_applies:
+        lines.append(f"− ضريبة {int(VAT_RATE * 100)}%:      {fmt(b.vat)}")
+        lines.append(f"= قبل الضريبة:    {fmt(b.net_price)}")
+    lines.append(f"− ذهب خام:        {fmt(b.market_price)}")
+
+    if b.making >= 0:
+        verdict = (
+            f"<b>المصنعية الفعلية: {fmt(b.making)} ريال للجرام</b>\n"
+            f"<i>أي {fmt(b.making_pct)}% فوق سعر الذهب</i>"
+        )
     else:
-        verdict = f"➖ تحت السوق بـ <b>{fmt(-diff)}</b> ريال للجرام ({fmt(-pct)}%)"
+        verdict = (
+            f"<b>⚠️ أقل من سعر الذهب بـ {fmt(-b.making)} ريال</b>\n"
+            f"<i>تأكد من العيار — أو يمكن يكون سعر شراء لا بيع.</i>"
+        )
 
+    if exempt:
+        note = "<i>سبيكة عيار 24: معفاة من الضريبة (ذهب استثماري نقاء ٩٩٪+).</i>"
+    elif asked_bullion:
+        note = (
+            f"<i>عيار {karat} ما يبلغ نقاء ٩٩٪، فما ينطبق عليه إعفاء الذهب "
+            f"الاستثماري ولو كان سبيكة.</i>"
+        )
+    else:
+        note = "<i>حسبتها كمشغولات (عليها ضريبة). للسبائك أضف كلمة «سبيكة».</i>"
+
+    body = "\n".join(lines)
     await update.message.reply_text(
-        f"<b>مقارنة عيار {karat}</b>\n"
-        f"سعر المحل: <b>{fmt(shop_price)}</b> ريال\n"
-        f"سعر السوق: <b>{fmt(market)}</b> ريال\n\n"
+        f"<b>🏪 تفكيك سعر عيار {karat}</b>\n"
+        f"<pre>{body}</pre>"
         f"{verdict}\n\n"
-        f"<i>الفرق يشمل المصنعية وهامش المحل والضريبة إن وُجدت.</i>",
+        f"{note}",
         parse_mode=ParseMode.HTML,
     )
 
