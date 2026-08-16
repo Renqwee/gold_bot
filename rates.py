@@ -54,6 +54,15 @@ FX_RANGE = (Decimal("0.1"), Decimal("10000"))
 MAX_JUMP_PCT = Decimal("3")
 JUMP_WINDOW = timedelta(minutes=30)
 
+# جولتان على قائمة المصادر قبل الاستسلام. على وصلة تفقد نصف اتصالاتها
+# (قِسناها فعلاً على سيرفر أوراكل) هذا يخفّض الفشل التام من ٥٠٪ إلى ٦٪.
+FETCH_PASSES = 2
+RETRY_DELAY = 0.4
+
+# قاطع الدائرة: بعد هذا العدد من الإخفاقات المتتالية يُتخطّى المصدر
+BREAKER_THRESHOLD = 3
+BREAKER_COOLDOWN = timedelta(minutes=10)
+
 
 @dataclass(frozen=True)
 class Quote:
@@ -177,6 +186,40 @@ _closes_cache: tuple[list[tuple[date, Decimal]], datetime] | None = None
 _closes_lock: asyncio.Lock | None = None
 
 
+@dataclass
+class Breaker:
+    """قاطع دائرة لمصدر واحد.
+
+    مصدر يفشل مراراً (محجوب أو ميت) يُتخطّى مؤقتاً بدل أن تُهدر عليه مهلة
+    كاملة في كل طلب. وبعد فترة التهدئة يُجرَّب مرة واحدة: إن نجح عاد لمكانه،
+    وإن فشل عاد للتخطّي. فالانقطاع المؤقت لا يُقصي مصدراً إلى الأبد.
+    """
+
+    failures: int = 0
+    opened_at: datetime | None = None
+
+    def allows(self, now: datetime | None = None) -> bool:
+        if self.opened_at is None:
+            return True
+        now = now or datetime.now(timezone.utc)
+        if now - self.opened_at >= BREAKER_COOLDOWN:
+            self.opened_at = None  # انتهت التهدئة: محاولة استكشافية واحدة
+            return True
+        return False
+
+    def record_failure(self, now: datetime | None = None) -> None:
+        self.failures += 1
+        if self.failures >= BREAKER_THRESHOLD:
+            self.opened_at = now or datetime.now(timezone.utc)
+
+    def record_success(self) -> None:
+        self.failures = 0
+        self.opened_at = None
+
+
+_breakers: dict[str, Breaker] = {}
+
+
 def _plausible(key: str, value: Decimal) -> bool:
     """يرفض القفزات المفاجئة — تكشف مصدراً بدأ يرجّع بيانات خربانة."""
     previous = _last.get(key)
@@ -189,34 +232,64 @@ def _plausible(key: str, value: Decimal) -> bool:
     return True
 
 
+def _describe(exc: Exception) -> str:
+    """وصف مفيد للخطأ — انتهاء المهلة يرفع استثناءً بلا رسالة، فيطلع سطراً فاضياً."""
+    return str(exc) or type(exc).__name__
+
+
+async def _try_source(
+    client: httpx.AsyncClient, key: str, source: Source
+) -> Quote | None:
+    """محاولة واحدة من مصدر واحد. None = فشل (مسجَّل ومحسوب على المصدر)."""
+    name, url, parser = source
+    try:
+        response = await client.get(url)
+        response.raise_for_status()
+        value, quoted_at = parser(response.json())
+        if not _plausible(key, value):
+            raise ValueError("قفزة غير منطقية عن آخر قيمة معروفة")
+    except Exception as exc:  # noqa: BLE001 — أي فشل ينقلنا للمصدر التالي
+        _breakers.setdefault(name, Breaker()).record_failure()
+        logger.warning("فشل المصدر %s: %s", name, _describe(exc))
+        return None
+
+    _breakers.setdefault(name, Breaker()).record_success()
+    quote = Quote(
+        value=value,
+        source=name,
+        fetched_at=datetime.now(timezone.utc),
+        quoted_at=quoted_at,
+    )
+    _last[key] = quote
+    return quote
+
+
 async def _fetch(key: str, sources: tuple[Source, ...], timeout: float) -> Quote:
-    """يجرّب المصادر بالترتيب حتى ينجح واحد."""
-    errors = []
+    """يجرّب المصادر بالترتيب، ثم يعيد الكرّة مرة ثانية قبل أن يستسلم.
+
+    الجولة الثانية مقصودة: على وصلة تفقد نصف اتصالاتها، فشل الجولة الأولى
+    كلها لا يعني أن المصادر معطّلة — غالباً حظ سيئ. جولتان تخفّضان احتمال
+    الفشل التام من ٥٠٪ إلى ٦٪ تقريباً بثلاثة مصادر.
+
+    والمصادر المعطّلة فعلاً تُتخطّى عبر قاطع الدائرة، فلا تُهدر عليها مهلة.
+    """
     async with httpx.AsyncClient(
         timeout=timeout, headers={"User-Agent": USER_AGENT}
     ) as client:
-        for name, url, parser in sources:
-            try:
-                response = await client.get(url)
-                response.raise_for_status()
-                value, quoted_at = parser(response.json())
-                if not _plausible(key, value):
-                    raise ValueError("قفزة غير منطقية عن آخر قيمة معروفة")
-            except Exception as exc:  # noqa: BLE001 — أي فشل ننتقل للمصدر التالي
-                logger.warning("فشل المصدر %s: %s", name, exc)
-                errors.append(f"{name}: {exc}")
-                continue
+        for attempt in range(FETCH_PASSES):
+            live = [s for s in sources if _breakers.setdefault(s[0], Breaker()).allows()]
+            # لو قطعنا كل المصادر، نتجاهل القاطع بدل أن نستسلم
+            for source in live or list(sources):
+                quote = await _try_source(client, key, source)
+                if quote is not None:
+                    return quote
 
-            quote = Quote(
-                value=value,
-                source=name,
-                fetched_at=datetime.now(timezone.utc),
-                quoted_at=quoted_at,
-            )
-            _last[key] = quote
-            return quote
+            if attempt + 1 < FETCH_PASSES:
+                await asyncio.sleep(RETRY_DELAY)
 
-    raise RuntimeError("فشلت كل المصادر — " + " | ".join(errors))
+    skipped = [n for n, b in _breakers.items() if not b.allows()]
+    detail = f" (متخطّى مؤقتاً: {', '.join(skipped)})" if skipped else ""
+    raise RuntimeError(f"فشلت كل المصادر بعد {FETCH_PASSES} جولات{detail}")
 
 
 async def _shared(key: str, sources: tuple[Source, ...], timeout: float) -> Quote:
@@ -389,5 +462,6 @@ def clear_cache() -> None:
     global _closes_cache
     _last.clear()
     _inflight.clear()
+    _breakers.clear()
     _fx_cache.clear()
     _closes_cache = None

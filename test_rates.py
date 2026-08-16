@@ -377,3 +377,108 @@ async def test_refetch_floor_never_serves_stale(monkeypatch):
     assert len(calls) == 1
     assert quote.value == Decimal("4380")
     assert quote.stale is False
+
+
+# ---------- قاطع الدائرة وإعادة المحاولة ----------
+
+
+def test_breaker_opens_after_threshold():
+    b = rates.Breaker()
+    for _ in range(rates.BREAKER_THRESHOLD - 1):
+        b.record_failure()
+        assert b.allows(), "ما يقطع قبل بلوغ الحد"
+    b.record_failure()
+    assert not b.allows(), "لازم يقطع عند الحد"
+
+
+def test_breaker_reopens_after_cooldown():
+    """انقطاع مؤقت ما يقصي مصدراً للأبد."""
+    now = datetime.now(timezone.utc)
+    b = rates.Breaker()
+    for _ in range(rates.BREAKER_THRESHOLD):
+        b.record_failure(now=now)
+
+    assert not b.allows(now=now)
+    assert b.allows(now=now + rates.BREAKER_COOLDOWN + timedelta(seconds=1))
+
+
+def test_success_resets_breaker():
+    b = rates.Breaker()
+    for _ in range(rates.BREAKER_THRESHOLD):
+        b.record_failure()
+    b.record_success()
+    assert b.allows()
+    assert b.failures == 0
+
+
+def test_describe_names_silent_exceptions():
+    """انتهاء المهلة يرفع استثناءً بلا رسالة، فكان السجل يطلع فاضياً."""
+    import httpx
+
+    assert rates._describe(httpx.ConnectTimeout("")) == "ConnectTimeout"
+    assert rates._describe(ValueError("رسالة واضحة")) == "رسالة واضحة"
+
+
+@pytest.mark.asyncio
+async def test_second_pass_rescues_flaky_link(monkeypatch):
+    """وصلة تفقد اتصالاتها: الجولة الأولى تفشل كلها، والثانية تنجح."""
+    calls = []
+
+    async def flaky(client, key, source):
+        calls.append(source[0])
+        # كل مصادر الجولة الأولى تفشل، ثم ينجح أول مصدر في الثانية
+        if len(calls) <= len(rates.SPOT_SOURCES):
+            rates._breakers.setdefault(source[0], rates.Breaker()).record_failure()
+            return None
+        return Quote(Decimal("4380"), source[0], datetime.now(timezone.utc))
+
+    monkeypatch.setattr(rates, "_try_source", flaky)
+    monkeypatch.setattr(rates, "RETRY_DELAY", 0)
+
+    quote = await rates._fetch("gold", rates.SPOT_SOURCES, 2.0)
+    assert quote.value == Decimal("4380")
+    assert len(calls) == len(rates.SPOT_SOURCES) + 1
+
+
+@pytest.mark.asyncio
+async def test_dead_source_is_skipped(monkeypatch):
+    """مصدر مقطوع ما تُهدر عليه مهلة في كل طلب."""
+    tried = []
+
+    async def only_second_works(client, key, source):
+        tried.append(source[0])
+        if source[0] == rates.SPOT_SOURCES[0][0]:
+            return None
+        return Quote(Decimal("4380"), source[0], datetime.now(timezone.utc))
+
+    # نقطع المصدر الأول مسبقاً
+    dead = rates.SPOT_SOURCES[0][0]
+    breaker = rates._breakers.setdefault(dead, rates.Breaker())
+    for _ in range(rates.BREAKER_THRESHOLD):
+        breaker.record_failure()
+
+    monkeypatch.setattr(rates, "_try_source", only_second_works)
+    await rates._fetch("gold", rates.SPOT_SOURCES, 2.0)
+
+    assert dead not in tried, "المصدر المقطوع لازم يُتخطّى"
+
+
+@pytest.mark.asyncio
+async def test_all_breakers_open_still_tries(monkeypatch):
+    """لو قُطعت كل المصادر، نتجاهل القاطع بدل أن نستسلم بلا محاولة."""
+    tried = []
+
+    async def works(client, key, source):
+        tried.append(source[0])
+        return Quote(Decimal("4380"), source[0], datetime.now(timezone.utc))
+
+    for name, _url, _p in rates.SPOT_SOURCES:
+        breaker = rates._breakers.setdefault(name, rates.Breaker())
+        for _ in range(rates.BREAKER_THRESHOLD):
+            breaker.record_failure()
+
+    monkeypatch.setattr(rates, "_try_source", works)
+    quote = await rates._fetch("gold", rates.SPOT_SOURCES, 2.0)
+
+    assert quote is not None
+    assert tried, "لازم يحاول رغم أن كل القواطع مفتوحة"
