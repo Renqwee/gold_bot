@@ -203,7 +203,7 @@ sudo cp gold-bot.service /etc/systemd/system/ && sudo systemctl enable --now gol
 
 لتشغيلها: **Settings ← Pages ← Source: Deploy from a branch ← Branch: `main` / مجلد `/docs`**.
 
-الرابط يصير `https://USERNAME.github.io/Gold_bot/` — حطه في `.env` كـ `SITE_URL`.
+الرابط يصير `https://USERNAME.github.io/gold_bot/` — حطه في `.env` كـ `SITE_URL`.
 
 اختبارات `test_docs.py` تتأكد أن ثوابت الصفحة (الأونصة، العيارات، الأوزان، مواعيد السوق)
 مطابقة لملفات بايثون، فما تنحرف الصفحة عن البوت بالغلط.

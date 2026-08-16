@@ -26,7 +26,7 @@ def test_valid_tokens_accepted(token):
         ("111111111", "بدون سرّ"),
         ("abc:AAF-ATkzO7BuDCDkVD2S6ZlvdXUU21n2qb4", "معرّف غير رقمي"),
         ("111111111:short", "السرّ قصير جداً"),
-        ("111111111:AAF-ATkzO7BuDCDkVD2S6ZlvdXUU21 n2qb4", "فيه مسافة"),
+        ("111111111:TESTtokenNOTreal AAAAAAAAAAAAAAAAA", "فيه مسافة"),
         ("", "فاضي"),
     ],
 )

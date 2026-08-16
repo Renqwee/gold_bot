@@ -18,8 +18,8 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 User=renqwee
-WorkingDirectory=/home/renqwee/Work/Projects/Gold_bot
-ExecStart=/home/renqwee/Work/Projects/Gold_bot/.venv/bin/python bot.py
+WorkingDirectory=/home/renqwee/Work/Projects/gold_bot
+ExecStart=/home/renqwee/Work/Projects/gold_bot/.venv/bin/python bot.py
 Restart=always
 RestartSec=10
 

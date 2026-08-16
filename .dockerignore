@@ -1,0 +1,33 @@
+# venv
+./.venv
+./venv
+
+# __pychach__
+__pycache__
+**/*.pyc
+**/*.pyo
+
+# env files
+.env
+env/
+.env.example
+
+# git history
+.git/
+.gitignore
+
+# Bot state and data
+bot_state.pickle
+
+# test files 
+test_*.py
+pytest.ini
+
+# System files 
+gold-bot.service
+README.md
+docs/
+
+# Docker files
+Dockerfile
+.dockerignore
